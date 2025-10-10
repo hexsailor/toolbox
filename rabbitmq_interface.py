@@ -5,6 +5,7 @@ Combines monitoring and command sending functionality
 
 USAGE EXAMPLES:
 python rabbitmq_interface.py --imei 350317177240177    # Open interface for specific IMEI
+python rabbitmq_interface.py -i 350317177240177        # Short form
 python rabbitmq_interface.py                           # Open general interface
 """
 
@@ -345,6 +346,9 @@ class RabbitMQInterface:
     def check_monitor_status(self):
         """Check queue status and message counts"""
         try:
+            # Ensure connection is healthy
+            self.ensure_connection()
+
             # Check main data queue
             queue_info = self.channel.queue_declare(self.data_queue, passive=True)
             message_count = queue_info.method.message_count
@@ -425,18 +429,18 @@ class RabbitMQInterface:
             pika_logger.setLevel(logging.WARNING)
             message_count = queue_info.method.message_count
             consumer_count = queue_info.method.consumer_count
-            
+
             print(f"\n🔧 COMMAND QUEUE STATUS")
             print(f"   Device IMEI: {imei}")
             print(f"   Pending Commands: {message_count}")
             print(f"   Active Consumers: {consumer_count}")
-            
+
             # Status indicators
             if consumer_count > 0:
                 print(f"   🟢 Device Status: ONLINE (consumer connected)")
             else:
                 print(f"   🔴 Device Status: OFFLINE (no consumer)")
-            
+
             if message_count > 0:
                 if consumer_count > 0:
                     print(f"   📤 Command Processing: Commands queued, being processed")
@@ -444,38 +448,48 @@ class RabbitMQInterface:
                     print(f"   ⏳ Command Processing: Commands waiting (device offline)")
                 
                 print(f"\n📋 NEXT COMMANDS TO PROCESS:")
-                
+
                 # Peek at commands (don't consume them)
-                for i in range(min(message_count, 3)):  # Show max 3
-                    method_frame, header_frame, body = self.channel.basic_get(
-                        queue=imei, auto_ack=False
-                    )
-                    
-                    if method_frame is None:
-                        break
-                    
-                    try:
-                        data = json.loads(body.decode("utf-8"))
-                        command = data.get("command", "Unknown")
-                        command_id = data.get("command_id", "N/A")
-                        # Safely truncate command_id if it's a string
-                        if isinstance(command_id, str):
-                            command_id = command_id[:8]
-                        timestamp = data.get("timestamp", "N/A")
-                        print(f"   {i+1}. {command}")
-                        print(f"      ID: {command_id}...")
-                        if timestamp != "N/A":
-                            try:
-                                dt = datetime.datetime.fromtimestamp(int(timestamp))
-                                print(f"      Queued: {dt.strftime('%H:%M:%S')}")
-                            except:
-                                print(f"      Timestamp: {timestamp}")
-                    except json.JSONDecodeError:
-                        print(f"   {i+1}. Raw message: {body.decode('utf-8', errors='ignore')[:50]}...")
-                    
-                    # Put message back in queue
-                    self.channel.basic_nack(delivery_tag=method_frame.delivery_tag)
-                
+                messages_to_requeue = []
+                try:
+                    for i in range(min(message_count, 3)):  # Show max 3
+                        method_frame, header_frame, body = self.channel.basic_get(
+                            queue=imei, auto_ack=False
+                        )
+
+                        if method_frame is None:
+                            break
+
+                        # Store delivery tag for requeuing
+                        messages_to_requeue.append(method_frame.delivery_tag)
+
+                        try:
+                            data = json.loads(body.decode("utf-8"))
+                            command = data.get("command", "Unknown")
+                            command_id = data.get("command_id", "N/A")
+                            # Safely truncate command_id if it's a string
+                            if isinstance(command_id, str):
+                                command_id = command_id[:8]
+                            timestamp = data.get("timestamp", "N/A")
+                            print(f"   {i+1}. {command}")
+                            print(f"      ID: {command_id}...")
+                            if timestamp != "N/A":
+                                try:
+                                    dt = datetime.datetime.fromtimestamp(int(timestamp))
+                                    print(f"      Queued: {dt.strftime('%H:%M:%S')}")
+                                except:
+                                    print(f"      Timestamp: {timestamp}")
+                        except json.JSONDecodeError:
+                            print(f"   {i+1}. Raw message: {body.decode('utf-8', errors='ignore')[:50]}...")
+
+                finally:
+                    # Put all messages back in queue in reverse order
+                    for delivery_tag in reversed(messages_to_requeue):
+                        try:
+                            self.channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+                        except Exception as e:
+                            logger.debug(f"Error requeuing message {delivery_tag}: {e}")
+
                 if message_count > 3:
                     print(f"   ... and {message_count - 3} more commands")
             else:
@@ -553,42 +567,48 @@ class RabbitMQInterface:
         """Analyze message types in queue"""
         message_types = {}
         imei_counts = {}
+        messages_to_requeue = []
 
-        for i in range(min(max_messages, 10)):  # Check max 10 messages
-            method_frame, header_frame, body = self.channel.basic_get(
-                self.data_queue, auto_ack=False
-            )
+        try:
+            for i in range(min(max_messages, 10)):  # Check max 10 messages
+                method_frame, header_frame, body = self.channel.basic_get(
+                    self.data_queue, auto_ack=False
+                )
 
-            if method_frame is None:
-                break
+                if method_frame is None:
+                    break
 
-            try:
-                data = json.loads(body.decode("utf-8"))
-                msg_type = data.get("type", "UNKNOWN")
-                imei = data.get("imei", "UNKNOWN")
+                # Store delivery tag for requeuing
+                messages_to_requeue.append(method_frame.delivery_tag)
 
-                # Always collect IMEI counts for breakdown
-                if imei not in imei_counts:
-                    imei_counts[imei] = 0
-                imei_counts[imei] += 1
+                try:
+                    data = json.loads(body.decode("utf-8"))
+                    msg_type = data.get("type", "UNKNOWN")
+                    imei = data.get("imei", "UNKNOWN")
 
-                # Filter by IMEI if specified for message type analysis
-                if self.target_imei and imei != self.target_imei:
-                    # Nack and skip this message for type analysis
-                    self.channel.basic_nack(delivery_tag=method_frame.delivery_tag)
-                    continue
+                    # Always collect IMEI counts for breakdown
+                    if imei not in imei_counts:
+                        imei_counts[imei] = 0
+                    imei_counts[imei] += 1
 
-                if msg_type not in message_types:
-                    message_types[msg_type] = 0
-                message_types[msg_type] += 1
+                    # Count message type (filter by IMEI if specified)
+                    if not self.target_imei or imei == self.target_imei:
+                        if msg_type not in message_types:
+                            message_types[msg_type] = 0
+                        message_types[msg_type] += 1
 
-            except json.JSONDecodeError:
-                if "RAW" not in message_types:
-                    message_types["RAW"] = 0
-                message_types["RAW"] += 1
+                except json.JSONDecodeError:
+                    if "RAW" not in message_types:
+                        message_types["RAW"] = 0
+                    message_types["RAW"] += 1
 
-            # Nack the message to put it back in the queue
-            self.channel.basic_nack(delivery_tag=method_frame.delivery_tag)
+        finally:
+            # Requeue all messages in reverse order to maintain original order
+            for delivery_tag in reversed(messages_to_requeue):
+                try:
+                    self.channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+                except Exception as e:
+                    logger.debug(f"Error requeuing message {delivery_tag}: {e}")
 
         # Return both message types and IMEI breakdown
         return message_types, imei_counts
@@ -596,6 +616,9 @@ class RabbitMQInterface:
     def peek_messages(self, limit=5, show_json=False):
         """Peek at messages without consuming them"""
         try:
+            # Ensure connection is healthy
+            self.ensure_connection()
+
             queue_info = self.channel.queue_declare(self.data_queue, passive=True)
             message_count = queue_info.method.message_count
 
@@ -612,36 +635,44 @@ class RabbitMQInterface:
             logger.info("=" * 60)
 
             messages_shown = 0
-            for i in range(min(limit * 3, message_count)):  # Check more messages to find filtered ones
-                method_frame, header_frame, body = self.channel.basic_get(
-                    self.data_queue, auto_ack=False
-                )
+            messages_to_requeue = []
 
-                if method_frame is None:
-                    break
+            try:
+                for i in range(min(limit * 3, message_count)):  # Check more messages to find filtered ones
+                    method_frame, header_frame, body = self.channel.basic_get(
+                        self.data_queue, auto_ack=False
+                    )
 
-                # Check if this message matches our IMEI filter
-                if self.target_imei:
-                    try:
-                        data = json.loads(body.decode("utf-8"))
-                        imei = data.get("imei", "UNKNOWN")
-                        if imei != self.target_imei:
-                            # Nack and skip this message
-                            self.channel.basic_nack(delivery_tag=method_frame.delivery_tag)
+                    if method_frame is None:
+                        break
+
+                    # Store delivery tag for requeuing
+                    messages_to_requeue.append(method_frame.delivery_tag)
+
+                    # Check if this message matches our IMEI filter
+                    if self.target_imei:
+                        try:
+                            data = json.loads(body.decode("utf-8"))
+                            imei = data.get("imei", "UNKNOWN")
+                            if imei != self.target_imei:
+                                continue
+                        except json.JSONDecodeError:
+                            # Skip raw messages when filtering by IMEI
                             continue
-                    except json.JSONDecodeError:
-                        # Nack and skip raw messages when filtering by IMEI
-                        self.channel.basic_nack(delivery_tag=method_frame.delivery_tag)
-                        continue
 
-                self._display_message(messages_shown + 1, body, show_json)
-                messages_shown += 1
+                    self._display_message(messages_shown + 1, body, show_json)
+                    messages_shown += 1
 
-                # Nack the message to put it back in the queue
-                self.channel.basic_nack(delivery_tag=method_frame.delivery_tag)
+                    if messages_shown >= limit:
+                        break
 
-                if messages_shown >= limit:
-                    break
+            finally:
+                # Requeue all messages in reverse order to maintain original order
+                for delivery_tag in reversed(messages_to_requeue):
+                    try:
+                        self.channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+                    except Exception as e:
+                        logger.debug(f"Error requeuing message {delivery_tag}: {e}")
 
             if self.target_imei and messages_shown == 0:
                 logger.info(f"❌ No messages found for IMEI: {self.target_imei}")
@@ -697,8 +728,8 @@ class RabbitMQInterface:
     def monitor_realtime(self, show_json=False):
         """Monitor queue in real-time for new messages"""
         try:
-            # Set up signal handler for graceful shutdown
-            signal.signal(signal.SIGINT, self._signal_handler)
+            # Ensure connection is healthy
+            self.ensure_connection()
 
             logger.info("=" * 60)
             logger.info("REAL-TIME MONITORING")
@@ -742,9 +773,19 @@ class RabbitMQInterface:
             self.channel.start_consuming()
 
         except KeyboardInterrupt:
-            logger.info("Stopping real-time monitor...")
+            logger.info("\n⏹️  Stopping real-time monitor...")
+            try:
+                if self.channel and self.channel.is_open:
+                    self.channel.stop_consuming()
+            except Exception as e:
+                logger.debug(f"Error stopping consumer: {e}")
         except Exception as e:
             logger.error(f"Error in real-time monitoring: {e}")
+            try:
+                if self.channel and self.channel.is_open:
+                    self.channel.stop_consuming()
+            except Exception:
+                pass
 
     def _signal_handler(self, signum, frame):
         """Handle Ctrl+C gracefully"""
@@ -1271,14 +1312,17 @@ class RabbitMQInterface:
             else:
                 print("MONITORING MENU - ALL DEVICES")
             print("=" * 50)
-            print("1. Check Queue Status")
-            print("2. Peek at Messages")
-            print("3. Real-time Monitor")
-            print("4. Peek Messages (with JSON)")
+            print("1. Check Queue Status (default)")
+            print("2. View Messages")
+            print("3. Start Consumer")
             print("0. Back to Main Menu")
             print("=" * 50)
 
-            choice = input("Enter your choice (0-4): ").strip()
+            choice = input("Enter your choice (0-3, default=1): ").strip()
+
+            # Default to option 1 if Enter is pressed
+            if choice == "":
+                choice = "1"
 
             if choice == "0":
                 break
@@ -1297,16 +1341,8 @@ class RabbitMQInterface:
                 print("Starting real-time monitor... Press Ctrl+C to stop")
                 self.monitor_realtime(show_json=False)
                 input("\nPress Enter to continue...")
-            elif choice == "4":
-                limit = input("Enter number of messages to peek (default: 5): ").strip()
-                try:
-                    limit = int(limit) if limit else 5
-                except ValueError:
-                    limit = 5
-                self.peek_messages(limit=limit, show_json=True)
-                input("\nPress Enter to continue...")
             else:
-                print("Invalid choice. Please enter 0-4.")
+                print("Invalid choice. Please enter 0-3.")
 
     def show_commands_menu(self, imei: str):
         """Show commands menu"""
@@ -1315,10 +1351,10 @@ class RabbitMQInterface:
             print(f"COMMANDS MENU - IMEI: {imei}")
             print("=" * 50)
             print("1. Send Command")
-            print("2. Set Commands")
-            print("3. Check Queue Status")
-            print("4. List Queue Commands")
-            print("5. Purge Queue")
+            print("2. Check Queue Status")
+            print("3. List Queue Commands")
+            print("4. Purge Queue")
+            print("5. Check Duplicate Server Config")
             print("0. Back to Main Menu")
             print("=" * 50)
 
@@ -1329,16 +1365,16 @@ class RabbitMQInterface:
             elif choice == "1":
                 self.show_command_menu(imei)
             elif choice == "2":
-                self.show_set_commands_menu(imei)
-            elif choice == "3":
                 self.check_queue_status(imei)
                 input("\nPress Enter to continue...")
-            elif choice == "4":
+            elif choice == "3":
                 self.list_queue_commands(imei)
                 input("\nPress Enter to continue...")
-            elif choice == "5":
+            elif choice == "4":
                 self.purge_queue(imei)
                 input("\nPress Enter to continue...")
+            elif choice == "5":
+                self.show_set_commands_menu(imei)
             else:
                 print("Invalid choice. Please enter 0-5.")
 
@@ -1348,8 +1384,8 @@ class RabbitMQInterface:
             print("\n" + "=" * 50)
             print("QUEUE OPERATIONS MENU")
             print("=" * 50)
-            print("1. List All Queues")
-            print("2. List Active Queues Only (🔥 RECOMMENDED FOR DEBUGGING)")
+            print("1. List Active Queues")
+            print("2. List All Queues (including idle)")
             print("3. List Non-IMEI Queues Only")
             print("4. List IMEI Queues Only")
             print("5. Inspect Queue(s) by Name/Partial Match")
@@ -1362,14 +1398,14 @@ class RabbitMQInterface:
                 break
             elif choice == "1":
                 try:
-                    self.list_all_queues("all")
+                    self.list_all_queues("active")
                 except Exception as e:
                     print(f"❌ Error listing queues: {e}")
                     logger.error(f"Error in list_all_queues: {e}")
                 input("\nPress Enter to continue...")
             elif choice == "2":
                 try:
-                    self.list_all_queues("active")
+                    self.list_all_queues("all")
                 except Exception as e:
                     print(f"❌ Error listing queues: {e}")
                     logger.error(f"Error in list_all_queues: {e}")
@@ -1409,7 +1445,7 @@ class RabbitMQInterface:
                             success = self.inspect_queues_by_partial_name(search_term)
 
                         if not success:
-                            print("💡 Tip: Use 'List All Queues' to see available queues")
+                            print("💡 Tip: Use 'List Active Queues' to see available queues")
                             print("💡 Try broader search terms like: 'device', 'tcp', 'error', 'alert'")
                     except Exception as e:
                         print(f"❌ Error inspecting queue: {e}")
@@ -1426,11 +1462,10 @@ class RabbitMQInterface:
         print("IMEI SELECTION")
         print("=" * 50)
         print("1. Enter IMEI")
-        print("2. Continue without IMEI (general operations)")
         print("=" * 50)
 
         while True:
-            choice = input("Enter your choice (1-2): ").strip()
+            choice = input("Enter your choice (1): ").strip()
 
             if choice == "1":
                 imei = input("Enter IMEI (e.g., 350317177240177): ").strip()
@@ -1438,10 +1473,8 @@ class RabbitMQInterface:
                     return imei
                 else:
                     print("❌ No IMEI entered")
-            elif choice == "2":
-                return None
             else:
-                print("Invalid choice. Please enter 1 or 2.")
+                print("Invalid choice. Please enter 1.")
 
     def show_main_menu(self):
         """Show main menu and handle user input"""
@@ -1456,11 +1489,10 @@ class RabbitMQInterface:
             print("1. Monitor")
             print("2. Commands")
             print("3. Queue Operations")
-            print("4. Change/Set IMEI")
             print("0. Exit")
             print("=" * 50)
 
-            choice = input("Enter your choice (0-4): ").strip()
+            choice = input("Enter your choice (0-3): ").strip()
 
             if choice == "0":
                 print("Goodbye!")
@@ -1479,17 +1511,8 @@ class RabbitMQInterface:
                 self.show_commands_menu(self.target_imei)
             elif choice == "3":
                 self.show_queue_operations_menu()
-            elif choice == "4":
-                imei = self.get_imei_input()
-                if imei:
-                    self.target_imei = imei
-                    print(f"✅ IMEI set to: {imei}")
-                else:
-                    self.target_imei = None
-                    print("✅ IMEI cleared")
-                input("\nPress Enter to continue...")
             else:
-                print("Invalid choice. Please enter 0-4.")
+                print("Invalid choice. Please enter 0-3.")
 
 
 def main():
@@ -1497,7 +1520,7 @@ def main():
         description="RabbitMQ Queue Manager"
     )
     parser.add_argument(
-        "--imei",
+        "--imei", "-i",
         type=str,
         help="IMEI of the target device (e.g., 350317177240177)",
     )
