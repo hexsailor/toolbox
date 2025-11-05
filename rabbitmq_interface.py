@@ -141,9 +141,21 @@ class RabbitMQInterface:
             if not self.connection or self.connection.is_closed:
                 logger.info("Connection lost, reconnecting...")
                 self.connect()
-            elif not self.channel or self.channel.is_closed:
+                return
+
+            # Test if connection is actually alive by checking if channel works
+            if not self.channel or self.channel.is_closed:
                 logger.info("Channel lost, recreating...")
                 self.channel = self.connection.channel()
+                return
+
+            # Verify channel is working by doing a lightweight operation
+            try:
+                self.connection.process_data_events(time_limit=0)
+            except Exception as e:
+                logger.warning(f"Connection appears broken, reconnecting: {e}")
+                self.connect()
+
         except Exception as e:
             logger.error(f"Error ensuring connection: {e}")
             self.connect()
@@ -152,49 +164,67 @@ class RabbitMQInterface:
     
     def send_command(self, imei: str, command: str, command_id: Optional[str] = None):
         """Send a command to a specific device queue"""
-        try:
-            # Generate command ID if not provided
-            if command_id is None:
-                command_id = str(uuid.uuid4())
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # Ensure connection is healthy
+                self.ensure_connection()
 
-            # Prepare command message
-            message = {
-                "command_id": command_id,
-                "command": command,
-                "timestamp": str(int(time.time())),
-                "source": "command_sender",
-            }
+                # Generate command ID if not provided
+                if command_id is None:
+                    command_id = str(uuid.uuid4())
 
-            # Declare queue (create if doesn't exist)
-            self.channel.queue_declare(queue=imei, durable=True)
+                # Prepare command message
+                message = {
+                    "command_id": command_id,
+                    "command": command,
+                    "timestamp": str(int(time.time())),
+                    "source": "command_sender",
+                }
 
-            # Send command
-            self.channel.basic_publish(
-                exchange="",
-                routing_key=imei,
-                body=json.dumps(message),
-                properties=pika.BasicProperties(
-                    delivery_mode=2,  # Persistent message
-                    content_type="application/json",
-                ),
-            )
+                # Declare queue (create if doesn't exist)
+                self.channel.queue_declare(queue=imei, durable=True)
 
-            logger.info("✅ Command sent successfully!")
-            logger.info(f"  IMEI: {imei}")
-            logger.info(f"  Command: {command}")
-            logger.info(f"  Command ID: {command_id}")
+                # Send command
+                self.channel.basic_publish(
+                    exchange="",
+                    routing_key=imei,
+                    body=json.dumps(message),
+                    properties=pika.BasicProperties(
+                        delivery_mode=2,  # Persistent message
+                        content_type="application/json",
+                    ),
+                )
 
-            # Check queue status
-            queue_info = self.channel.queue_declare(queue=imei, passive=True)
-            logger.info(
-                f"  Queue status: {queue_info.method.message_count} messages in queue"
-            )
+                logger.info("✅ Command sent successfully!")
+                logger.info(f"  IMEI: {imei}")
+                logger.info(f"  Command: {command}")
+                logger.info(f"  Command ID: {command_id}")
 
-            return True
+                # Check queue status
+                queue_info = self.channel.queue_declare(queue=imei, passive=True)
+                logger.info(
+                    f"  Queue status: {queue_info.method.message_count} messages in queue"
+                )
 
-        except Exception as e:
-            logger.error(f"Failed to send command: {e}")
-            return False
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to send command (attempt {attempt + 1}/{max_retries}): {e}")
+
+                # If this is not the last attempt, try to reconnect
+                if attempt < max_retries - 1:
+                    logger.info("Attempting to reconnect...")
+                    try:
+                        self.connect()
+                        time.sleep(1)  # Brief delay before retry
+                    except Exception as reconnect_error:
+                        logger.error(f"Reconnection failed: {reconnect_error}")
+                else:
+                    logger.error("Failed to send command after retries. Please check connection.")
+                    return False
+
+        return False
 
     def check_queue_status(self, imei: str):
         """Check the status of a device's command queue"""
@@ -345,79 +375,107 @@ class RabbitMQInterface:
     
     def check_monitor_status(self):
         """Check queue status and message counts"""
-        try:
-            # Ensure connection is healthy
-            self.ensure_connection()
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # Ensure connection is healthy
+                self.ensure_connection()
 
-            # Check main data queue
-            queue_info = self.channel.queue_declare(self.data_queue, passive=True)
-            message_count = queue_info.method.message_count
-            consumer_count = queue_info.method.consumer_count
+                # Check main data queue
+                queue_info = self.channel.queue_declare(self.data_queue, passive=True)
+                message_count = queue_info.method.message_count
+                consumer_count = queue_info.method.consumer_count
 
-            print("\n" + "=" * 70)
-            print("🔍 RABBITMQ STATUS OVERVIEW")
-            if self.target_imei:
-                print(f"📱 Target Device: {self.target_imei}")
-            else:
-                print("📱 Target Device: ALL DEVICES")
-            print("=" * 70)
-            
-            # Main data queue status
-            print(f"\n📊 DATA QUEUE STATUS")
-            print(f"   Queue Name: {self.data_queue}")
-            print(f"   Total Messages: {message_count:,}")
-            print(f"   Active Consumers: {consumer_count}")
-            
-            if consumer_count == 0 and message_count > 0:
-                print(f"   ⚠️  Warning: No consumers processing messages")
+                print("\n" + "=" * 70)
+                print("🔍 RABBITMQ STATUS OVERVIEW")
+                if self.target_imei:
+                    print(f"📱 Target Device: {self.target_imei}")
+                else:
+                    print("📱 Target Device: ALL DEVICES")
+                print("=" * 70)
 
-            if message_count > 0:
-                # Check message types
-                message_types, imei_breakdown = self._analyze_message_types(message_count)
-                
-                # Show IMEI-specific info if filtering
-                if self.target_imei and imei_breakdown:
-                    filtered_count = sum(imei_breakdown.values())
-                    print(f"\n📱 TARGET DEVICE DATA:")
-                    print(f"   Messages from {self.target_imei}: {filtered_count:,}")
-                
-                print(f"\n📈 MESSAGE BREAKDOWN:")
-                for msg_type, count in message_types.items():
-                    if msg_type == "DATA":
-                        print(f"   📍 {msg_type}: {count:,} messages")
-                    elif msg_type == "CONNECTION":
-                        print(f"   📡 {msg_type}: {count:,} messages")
-                    elif msg_type == "RAW":
-                        print(f"   📦 {msg_type}: {count:,} messages")
+                # Main data queue status
+                print(f"\n📊 DATA QUEUE STATUS")
+                print(f"   Queue Name: {self.data_queue}")
+                print(f"   Total Messages: {message_count:,}")
+                print(f"   Active Consumers: {consumer_count}")
+
+                if consumer_count == 0 and message_count > 0:
+                    print(f"   ⚠️  Warning: No consumers processing messages")
+
+                if message_count > 0:
+                    # Check message types
+                    message_types, imei_breakdown = self._analyze_message_types(message_count)
+
+                    # Show IMEI-specific info if filtering
+                    if self.target_imei and imei_breakdown:
+                        filtered_count = sum(imei_breakdown.values())
+                        print(f"\n📱 TARGET DEVICE DATA:")
+                        print(f"   Messages from {self.target_imei}: {filtered_count:,}")
+
+                    print(f"\n📈 MESSAGE BREAKDOWN:")
+                    for msg_type, count in message_types.items():
+                        if msg_type == "DATA":
+                            print(f"   📍 {msg_type}: {count:,} messages")
+                        elif msg_type == "CONNECTION":
+                            print(f"   📡 {msg_type}: {count:,} messages")
+                        elif msg_type == "RAW":
+                            print(f"   📦 {msg_type}: {count:,} messages")
+                        else:
+                            print(f"   ❓ {msg_type}: {count:,} messages")
+
+                    # Health indicators
+                    print(f"\n🏥 QUEUE HEALTH:")
+                    if "DATA" in message_types:
+                        print(f"   ✅ AVL Data Flow: Active ({message_types['DATA']:,} messages)")
                     else:
-                        print(f"   ❓ {msg_type}: {count:,} messages")
+                        print(f"   ❌ AVL Data Flow: No recent data messages")
 
-                # Health indicators
-                print(f"\n🏥 QUEUE HEALTH:")
-                if "DATA" in message_types:
-                    print(f"   ✅ AVL Data Flow: Active ({message_types['DATA']:,} messages)")
+                    if consumer_count > 0:
+                        print(f"   ✅ Message Processing: Active ({consumer_count} consumers)")
+                    else:
+                        print(f"   ⚠️  Message Processing: No active consumers")
                 else:
-                    print(f"   ❌ AVL Data Flow: No recent data messages")
+                    print(f"\n📭 Queue is currently empty")
 
-                if consumer_count > 0:
-                    print(f"   ✅ Message Processing: Active ({consumer_count} consumers)")
+                # Check command queues if IMEI is specified
+                if self.target_imei:
+                    self._check_command_queue_status(self.target_imei)
                 else:
-                    print(f"   ⚠️  Message Processing: No active consumers")
-            else:
-                print(f"\n📭 Queue is currently empty")
+                    self._check_all_command_queues()
 
-            # Check command queues if IMEI is specified
-            if self.target_imei:
-                self._check_command_queue_status(self.target_imei)
-            else:
-                self._check_all_command_queues()
+                print("=" * 70)
+                return message_count, message_types if message_count > 0 else {}
 
-            print("=" * 70)
-            return message_count, message_types if message_count > 0 else {}
+            except Exception as e:
+                logger.error(f"Error checking status (attempt {attempt + 1}/{max_retries}): {e}")
 
-        except Exception as e:
-            logger.error(f"Error checking status: {e}")
-            return 0, {}
+                # If this is not the last attempt, try to reconnect
+                if attempt < max_retries - 1:
+                    logger.info("Attempting to reconnect...")
+                    try:
+                        self.connect()
+                        time.sleep(1)  # Brief delay before retry
+                    except Exception as reconnect_error:
+                        logger.error(f"Reconnection failed: {reconnect_error}")
+                else:
+                    # Last attempt failed, give up
+                    print("\n" + "=" * 70)
+                    print("❌ CONNECTION ERROR")
+                    print("=" * 70)
+                    print(f"Failed to check RabbitMQ status: {e}")
+                    print("\n💡 Possible causes:")
+                    print("   1. RabbitMQ server connection was lost")
+                    print("   2. Network issue or timeout")
+                    print("   3. RabbitMQ server restarted")
+                    print("\n🔧 Suggestions:")
+                    print("   1. Check if RabbitMQ server is running")
+                    print("   2. Try the operation again")
+                    print("   3. Restart this interface if problem persists")
+                    print("=" * 70)
+                    return 0, {}
+
+        return 0, {}
 
     def _check_command_queue_status(self, imei: str):
         """Check status of a specific command queue"""
@@ -615,72 +673,87 @@ class RabbitMQInterface:
 
     def peek_messages(self, limit=5, show_json=False):
         """Peek at messages without consuming them"""
-        try:
-            # Ensure connection is healthy
-            self.ensure_connection()
-
-            queue_info = self.channel.queue_declare(self.data_queue, passive=True)
-            message_count = queue_info.method.message_count
-
-            if message_count == 0:
-                logger.info("📭 No messages in queue to peek")
-                return
-
-            logger.info("=" * 60)
-            logger.info(
-                f"PEEKING AT MESSAGES (showing {min(limit, message_count)} of {message_count})"
-            )
-            if self.target_imei:
-                logger.info(f"Filtering for IMEI: {self.target_imei}")
-            logger.info("=" * 60)
-
-            messages_shown = 0
-            messages_to_requeue = []
-
+        max_retries = 2
+        for attempt in range(max_retries):
             try:
-                for i in range(min(limit * 3, message_count)):  # Check more messages to find filtered ones
-                    method_frame, header_frame, body = self.channel.basic_get(
-                        self.data_queue, auto_ack=False
-                    )
+                # Ensure connection is healthy
+                self.ensure_connection()
 
-                    if method_frame is None:
-                        break
+                queue_info = self.channel.queue_declare(self.data_queue, passive=True)
+                message_count = queue_info.method.message_count
 
-                    # Store delivery tag for requeuing
-                    messages_to_requeue.append(method_frame.delivery_tag)
+                if message_count == 0:
+                    logger.info("📭 No messages in queue to peek")
+                    return
 
-                    # Check if this message matches our IMEI filter
-                    if self.target_imei:
-                        try:
-                            data = json.loads(body.decode("utf-8"))
-                            imei = data.get("imei", "UNKNOWN")
-                            if imei != self.target_imei:
+                logger.info("=" * 60)
+                logger.info(
+                    f"PEEKING AT MESSAGES (showing {min(limit, message_count)} of {message_count})"
+                )
+                if self.target_imei:
+                    logger.info(f"Filtering for IMEI: {self.target_imei}")
+                logger.info("=" * 60)
+
+                messages_shown = 0
+                messages_to_requeue = []
+
+                try:
+                    for i in range(min(limit * 3, message_count)):  # Check more messages to find filtered ones
+                        method_frame, header_frame, body = self.channel.basic_get(
+                            self.data_queue, auto_ack=False
+                        )
+
+                        if method_frame is None:
+                            break
+
+                        # Store delivery tag for requeuing
+                        messages_to_requeue.append(method_frame.delivery_tag)
+
+                        # Check if this message matches our IMEI filter
+                        if self.target_imei:
+                            try:
+                                data = json.loads(body.decode("utf-8"))
+                                imei = data.get("imei", "UNKNOWN")
+                                if imei != self.target_imei:
+                                    continue
+                            except json.JSONDecodeError:
+                                # Skip raw messages when filtering by IMEI
                                 continue
-                        except json.JSONDecodeError:
-                            # Skip raw messages when filtering by IMEI
-                            continue
 
-                    self._display_message(messages_shown + 1, body, show_json)
-                    messages_shown += 1
+                        self._display_message(messages_shown + 1, body, show_json)
+                        messages_shown += 1
 
-                    if messages_shown >= limit:
-                        break
+                        if messages_shown >= limit:
+                            break
 
-            finally:
-                # Requeue all messages in reverse order to maintain original order
-                for delivery_tag in reversed(messages_to_requeue):
+                finally:
+                    # Requeue all messages in reverse order to maintain original order
+                    for delivery_tag in reversed(messages_to_requeue):
+                        try:
+                            self.channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
+                        except Exception as e:
+                            logger.debug(f"Error requeuing message {delivery_tag}: {e}")
+
+                if self.target_imei and messages_shown == 0:
+                    logger.info(f"❌ No messages found for IMEI: {self.target_imei}")
+
+                logger.info("=" * 60)
+                return  # Success, exit retry loop
+
+            except Exception as e:
+                logger.error(f"Error peeking messages (attempt {attempt + 1}/{max_retries}): {e}")
+
+                # If this is not the last attempt, try to reconnect
+                if attempt < max_retries - 1:
+                    logger.info("Attempting to reconnect...")
                     try:
-                        self.channel.basic_nack(delivery_tag=delivery_tag, requeue=True)
-                    except Exception as e:
-                        logger.debug(f"Error requeuing message {delivery_tag}: {e}")
-
-            if self.target_imei and messages_shown == 0:
-                logger.info(f"❌ No messages found for IMEI: {self.target_imei}")
-
-            logger.info("=" * 60)
-
-        except Exception as e:
-            logger.error(f"Error peeking messages: {e}")
+                        self.connect()
+                        time.sleep(1)  # Brief delay before retry
+                    except Exception as reconnect_error:
+                        logger.error(f"Reconnection failed: {reconnect_error}")
+                else:
+                    # Last attempt failed
+                    logger.error("Failed to peek messages after retries. Please check connection.")
 
     def _display_message(self, msg_num, body, show_json=False):
         """Display a single message"""
@@ -781,9 +854,16 @@ class RabbitMQInterface:
                 logger.debug(f"Error stopping consumer: {e}")
         except Exception as e:
             logger.error(f"Error in real-time monitoring: {e}")
+            logger.error("Connection may have been lost. Please try reconnecting.")
             try:
                 if self.channel and self.channel.is_open:
                     self.channel.stop_consuming()
+            except Exception:
+                pass
+            # Try to clean up and reconnect for next operation
+            try:
+                if self.connection and not self.connection.is_closed:
+                    self.connection.close()
             except Exception:
                 pass
 
