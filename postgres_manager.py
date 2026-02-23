@@ -61,6 +61,7 @@ class DatabaseConfig:
     postgres_image: str
     remote_db_name: str
     remote_db_user: str
+    remote_db_port: int
     needs_password: bool
     remote_db_key: str
     dump_file_prefix: str
@@ -77,6 +78,7 @@ WATCHDOG_CONFIG = DatabaseConfig(
     postgres_image="timescale/timescaledb-ha:pg16-ts2.18",
     remote_db_name="watchdog2",
     remote_db_user="watchdog2",
+    remote_db_port=5433,
     needs_password=False,
     remote_db_key="wd3",
     dump_file_prefix="wd3-stage-dump",
@@ -93,6 +95,7 @@ BILLSEN_CONFIG = DatabaseConfig(
     postgres_image="postgres:16",
     remote_db_name="billsen",
     remote_db_user="billsen",
+    remote_db_port=5432,
     needs_password=True,
     remote_db_key="billsen",
     dump_file_prefix="billsen-stage-dump",
@@ -433,7 +436,11 @@ class PostgresManager:
         log_info(
             f"Creating PostgreSQL database dump on remote server ({SSH_HOST_ALIAS})..."
         )
-        dump_cmd = f"{pgpassword_cmd}pg_dump -h {DB_HOST} -U {self.config.remote_db_user} -Fc {self.config.remote_db_name} > {REMOTE_TMP_DIR}/{filename}"
+        dump_cmd = f"{pgpassword_cmd}pg_dump -h {DB_HOST} -p {self.config.remote_db_port} -U {self.config.remote_db_user} -Fc {self.config.remote_db_name} > {REMOTE_TMP_DIR}/{filename}"
+
+        # Show command being executed (mask password if present)
+        display_cmd = dump_cmd.replace(pgpassword_cmd, "PGPASSWORD='***' " if pgpassword_cmd else "")
+        log_info(f"Executing: {display_cmd}")
 
         result = run_command(["ssh", SSH_HOST_ALIAS, dump_cmd])
         if result.returncode != 0:
@@ -585,6 +592,47 @@ class PostgresManager:
             ]
         )
 
+        # Drop and recreate database for clean restore
+        log_info(f"Dropping existing database {self.config.postgres_db}...")
+        result = run_command(
+            [
+                "docker",
+                "exec",
+                self.config.container_name,
+                "psql",
+                "-U",
+                self.config.postgres_user,
+                "-d",
+                "postgres",
+                "-c",
+                f"DROP DATABASE IF EXISTS {self.config.postgres_db};",
+            ]
+        )
+
+        if result.returncode != 0:
+            log_error("Failed to drop database")
+            return False
+
+        log_info(f"Creating fresh database {self.config.postgres_db}...")
+        result = run_command(
+            [
+                "docker",
+                "exec",
+                self.config.container_name,
+                "psql",
+                "-U",
+                self.config.postgres_user,
+                "-d",
+                "postgres",
+                "-c",
+                f"CREATE DATABASE {self.config.postgres_db} OWNER {self.config.postgres_user};",
+            ]
+        )
+
+        if result.returncode != 0:
+            log_error("Failed to create database")
+            return False
+
         # Create extensions
         self.create_extensions()
 
@@ -596,7 +644,6 @@ class PostgresManager:
                 "exec",
                 self.config.container_name,
                 "pg_restore",
-                "--clean",
                 "--no-owner",
                 "-U",
                 self.config.postgres_user,
